@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.3.4
+- [FEAT] Optionally surface unreachable bulbs as "Not Responding" in HomeKit via new `reportOffline` config flag
+- [FIX] Filter undefined fields before merging cached pilot state (prevents NaN brightness when firmware omits `dimming`)
+- [FIX] Add fallback in `pilotToColor()` for empty cache entries (prevents crashes on color/temperature changes after timeout)
+- Thank you [@dhananjaysathe](https://github.com/dhananjaysathe) for [#173](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/173)
+
 ## 3.3.2
 - [FEAT] Experimental support for Light Strips
 

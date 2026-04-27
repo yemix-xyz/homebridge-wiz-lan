@@ -128,6 +128,9 @@ Thanks to:
 #### [@pyrliu](https://github.com/pyrliu)
 [#118 Added support for Wiz Smart Plug ESP25_SOCKET_01](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/118)
 
+#### [@dhananjaysathe](https://github.com/dhananjaysathe)
+[#173 Surface unreachable bulbs as 'Not Responding' via HAP](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/173)
+
 ## Contributing
 
 Mostly built for my own personal use, I'll probably reply to any created issues but probably will not actively support anything outside of the RGB bulbs. If you'd like to make a PR through, <3
