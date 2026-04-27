@@ -84,14 +84,27 @@ export default class HomebridgeWizLan {
     const interval = Number(this.config.refreshInterval ?? 0);
     if (interval === 0) {
       this.log.info("[Refresh] Pings are off");
+      if (this.config.reportOffline) {
+        this.log.warn(
+          "[Refresh] reportOffline is enabled but refreshInterval is 0. " +
+          "Without periodic pings unreachable bulbs will only surface when HomeKit reads them.",
+        );
+      }
     } else {
       this.log.info(`[Refresh] Setting up ping for every ${interval} seconds`);
       setInterval(() => {
         const accessories = Object.values(this.initializedAccessories);
         this.log.debug(`[Refresh] Pinging ${accessories.length} accessories...`);
         for (const accessory of accessories) {
-          accessory.getPilot().catch((error) => this.log.error(error));
+          // Failures are tracked via the reachability util and surfaced to
+          // HomeKit through the characteristic get-callback; logging them at
+          // info here would spam the log for offline bulbs every interval.
+          accessory.getPilot().catch((error) => this.log.debug(`[Refresh] ${error}`));
         }
+        // Re-broadcast discovery so bulbs that came back online (or got a new
+        // DHCP lease) re-announce themselves — otherwise `device.ip` can stay
+        // stuck at a stale address indefinitely.
+        sendDiscoveryBroadcast(this);
       }, interval * 1000);
     }
   }
@@ -184,7 +197,16 @@ export default class HomebridgeWizLan {
       if (this.deviceShouldBeIgnored(device)) {
         return;
       }
-      this.log.info(`Updating accessory: ${name}${name == existingAccessory.displayName ? "" : ` [formerly ${existingAccessory.displayName}]`}`);
+      // Only log at info when the display name actually changed — otherwise
+      // a periodic rediscovery (see initRefreshInterval) would spam one
+      // "Updating accessory: …" line per configured device per tick.
+      const renamed = name !== existingAccessory.displayName;
+      const msg = `Updating accessory: ${name}${renamed ? ` [formerly ${existingAccessory.displayName}]` : ""}`;
+      if (renamed) {
+        this.log.info(msg);
+      } else {
+        this.log.debug(msg);
+      }
       existingAccessory.displayName = name;
       this.api.updatePlatformAccessories([existingAccessory]);
       // try initializing again in case it didn't the last time
