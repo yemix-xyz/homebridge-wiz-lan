@@ -1,0 +1,364 @@
+import {
+  beforeEach,
+  describe,
+  expect,
+  it,
+  mock,
+} from "bun:test";
+
+// Intercept the network module *before* importing pilot. Tests fire pending
+// network callbacks manually to simulate UDP replies.
+const pendingGet: ((e: Error | null, p: any) => void)[] = [];
+const pendingSet: ((e: Error | null) => void)[] = [];
+const getPilotMock = mock(
+  (_w: any, _d: any, cb: (e: Error | null, p: any) => void) => {
+    pendingGet.push(cb);
+  },
+);
+const setPilotMock = mock(
+  (_w: any, _d: any, _p: any, cb: (e: Error | null) => void) => {
+    pendingSet.push(cb);
+  },
+);
+
+mock.module("../../../src/util/network", () => ({
+  getPilot: getPilotMock,
+  setPilot: setPilotMock,
+}));
+
+import {
+  cachedPilot,
+  disabledAdaptiveLightingCallback,
+  getPilot,
+  pilotToColor,
+  setPilot,
+  updateColorTemp,
+} from "../../../src/accessories/WizLight/pilot";
+import { recordSuccess as _recordSuccess } from "../../../src/util/offline";
+import {
+  makeAccessoryWithService,
+  makeDevice,
+  makeFakeWiz,
+  makeLightPilot,
+} from "../../__helpers__/factories";
+
+const TEST_MAC = "AABBCCDDEEFF";
+
+beforeEach(() => {
+  for (const k of Object.keys(cachedPilot)) delete cachedPilot[k];
+  for (const k of Object.keys(disabledAdaptiveLightingCallback))
+    delete disabledAdaptiveLightingCallback[k];
+  pendingGet.length = 0;
+  pendingSet.length = 0;
+  getPilotMock.mockClear();
+  setPilotMock.mockClear();
+  // clear offline state for any MAC a test might use
+  _recordSuccess(TEST_MAC);
+  _recordSuccess(`${TEST_MAC}T1`);
+  _recordSuccess(`${TEST_MAC}T2`);
+  _recordSuccess(`${TEST_MAC}T3`);
+});
+
+describe("WizLight/pilot: pilotToColor", () => {
+  it("derives hsv+temp from a temp-pilot", () => {
+    const out = pilotToColor(makeLightPilot({ temp: 4000 }));
+    expect(out.temp).toBe(4000);
+    expect(out.hue).toBeGreaterThanOrEqual(0);
+    expect(out.saturation).toBeGreaterThanOrEqual(0);
+  });
+
+  it("derives hsv+temp from an rgb-pilot", () => {
+    const out = pilotToColor(makeLightPilot({ r: 255, g: 0, b: 0 }));
+    expect(out.hue).toBe(0);
+    expect(out.saturation).toBe(100);
+  });
+
+  it("treats missing rgb fields as 0", () => {
+    const out = pilotToColor(makeLightPilot({ r: 50 } as any));
+    expect(typeof out.hue).toBe("number");
+    expect(typeof out.temp).toBe("number");
+  });
+});
+
+describe("WizLight/pilot: getPilot success path", () => {
+  it("populates cachedPilot and calls onSuccess", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC });
+    let received: any = null;
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      (p) => (received = p),
+      () => {},
+    );
+    expect(pendingGet.length).toBe(1);
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, dimming: 80 }));
+    expect(received).not.toBeNull();
+    expect(cachedPilot[TEST_MAC]).toBeDefined();
+    expect(cachedPilot[TEST_MAC].dimming).toBe(80);
+  });
+
+  it("uses on/off state to compute default dimming when neither reply nor cache has it", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC });
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      () => {},
+      () => {},
+    );
+    pendingGet[0](null, {
+      mac: TEST_MAC,
+      rssi: -50,
+      src: "udp",
+      state: false, // off
+      // no dimming
+    });
+    expect(cachedPilot[TEST_MAC].dimming).toBe(10);
+  });
+
+  it("triggers disabled-adaptive-lighting callback when color/scene changed", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC });
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 10,
+      g: 10,
+      b: 10,
+    });
+    let adaptiveDisabled = false;
+    disabledAdaptiveLightingCallback[TEST_MAC] = () => {
+      adaptiveDisabled = true;
+    };
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      () => {},
+      () => {},
+    );
+    pendingGet[0](
+      null,
+      makeLightPilot({ mac: TEST_MAC, r: 200, g: 0, b: 0 }),
+    );
+    expect(adaptiveDisabled).toBe(true);
+  });
+});
+
+describe("WizLight/pilot: error fallback & offline handling", () => {
+  it("falls back to cached state when the network errors and a cache exists", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: `${TEST_MAC}T1` });
+    cachedPilot[device.mac] = makeLightPilot({ mac: device.mac, state: true });
+    let received: any = null;
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      (p) => (received = p),
+      () => {},
+    );
+    pendingGet[0](new Error("timeout"), null);
+    expect(received).toBeDefined();
+    expect(received.state).toBe(true);
+  });
+
+  it("calls onError when the network errors and no cache exists", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: `${TEST_MAC}T2` });
+    let err: Error | null = null;
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      () => {},
+      (e) => (err = e),
+    );
+    pendingGet[0](new Error("timeout"), null);
+    expect(err).not.toBeNull();
+  });
+
+  it("marks device offline after pingFailuresBeforeOffline consecutive failures", () => {
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 2 } as any);
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: `${TEST_MAC}T3` });
+    let errSeen: Error | null = null;
+    // First failure — not yet over threshold, falls through to cache-or-error
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (errSeen = e));
+    pendingGet[0](new Error("timeout"), null);
+    // No cache → onError fired with the original network error (not HAP)
+    expect(errSeen).not.toBeNull();
+    expect((errSeen as any).hapStatus).toBeUndefined();
+
+    // Second failure — crosses threshold; should emit a HapStatusError
+    errSeen = null;
+    pendingGet.length = 0;
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (errSeen = e));
+    pendingGet[0](new Error("timeout"), null);
+    expect(errSeen).not.toBeNull();
+    expect((errSeen as any).hapStatus).toBeDefined();
+    // log.warn was called with "now offline" message
+    expect(wiz.log.warn).toHaveBeenCalled();
+  });
+});
+
+describe("WizLight/pilot: setPilot scene/color exclusivity", () => {
+  const baseDevice = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+
+  it("returns an error to the callback when there is no cached state", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    let err: Error | null = null;
+    setPilot(wiz, accessory as any, baseDevice, { state: true }, (e) => (err = e));
+    expect(err).not.toBeNull();
+    expect((err as any).message).toMatch(/No cached state/);
+    expect(setPilotMock).not.toHaveBeenCalled();
+  });
+
+  it("setting sceneId clears r/g/b/temp on outgoing pilot", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 100,
+      g: 50,
+      b: 25,
+      temp: 4000,
+    });
+    setPilot(wiz, accessory as any, baseDevice, { sceneId: 4 }, () => {});
+    expect(setPilotMock).toHaveBeenCalledTimes(1);
+    const sent = setPilotMock.mock.calls[0][2];
+    expect(sent.sceneId).toBe(4);
+    expect(sent.r).toBeUndefined();
+    expect(sent.g).toBeUndefined();
+    expect(sent.b).toBeUndefined();
+    expect(sent.temp).toBeUndefined();
+  });
+
+  it("setting color clears sceneId/speed on outgoing pilot", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      sceneId: 4,
+      speed: 50,
+    } as any);
+    setPilot(
+      wiz,
+      accessory as any,
+      baseDevice,
+      { r: 255, g: 0, b: 0 },
+      () => {},
+    );
+    const sent = setPilotMock.mock.calls[0][2];
+    expect(sent.r).toBe(255);
+    expect(sent.sceneId).toBeUndefined();
+    expect(sent.speed).toBeUndefined();
+  });
+
+  it("setting temp clears sceneId on outgoing pilot", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      sceneId: 4,
+    } as any);
+    setPilot(wiz, accessory as any, baseDevice, { temp: 3000 }, () => {});
+    const sent = setPilotMock.mock.calls[0][2];
+    expect(sent.temp).toBe(3000);
+    expect(sent.sceneId).toBeUndefined();
+  });
+
+  it("with lastStatus=true and a state-only update, sends only {state}", () => {
+    const wiz = makeFakeWiz({ lastStatus: true } as any);
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      dimming: 75,
+      r: 1, g: 2, b: 3,
+    });
+    setPilot(wiz, accessory as any, baseDevice, { state: true }, () => {});
+    const sent = setPilotMock.mock.calls[0][2];
+    expect(sent).toEqual({ state: true });
+  });
+
+  it("reverts the cache when the network call returns an error", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const oldPilot = makeLightPilot({ mac: TEST_MAC, dimming: 50 });
+    cachedPilot[TEST_MAC] = oldPilot;
+    setPilot(
+      wiz,
+      accessory as any,
+      baseDevice,
+      { dimming: 100 },
+      () => {},
+    );
+    // Cache should optimistically be updated
+    expect(cachedPilot[TEST_MAC].dimming).toBe(100);
+    // Now fire the network failure
+    pendingSet[0](new Error("boom"));
+    expect(cachedPilot[TEST_MAC]).toBe(oldPilot);
+  });
+});
+
+describe("WizLight/pilot: updateColorTemp", () => {
+  it("for RGB devices, updates hue/saturation/temperature characteristics on success", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 0,
+      g: 255,
+      b: 0,
+    });
+    const next = mock(() => {});
+    const callback = updateColorTemp(device, accessory as any, wiz, next);
+    callback(null);
+
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.Hue).updateValue)
+      .toHaveBeenCalled();
+    expect(
+      svc.getCharacteristic(wiz.Characteristic.Saturation).updateValue,
+    ).toHaveBeenCalled();
+    expect(
+      svc.getCharacteristic(wiz.Characteristic.ColorTemperature).updateValue,
+    ).toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(null);
+  });
+
+  it("skips characteristic updates for non-RGB/non-TW devices but still calls next", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP06_SHDW_01" });
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC });
+    const next = mock(() => {});
+    const callback = updateColorTemp(device, accessory as any, wiz, next);
+    callback(null);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(
+      svc.getCharacteristic(wiz.Characteristic.ColorTemperature).updateValue,
+    ).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(null);
+  });
+
+  it("propagates error to next() without touching characteristics", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC });
+    const next = mock(() => {});
+    const err = new Error("set failed");
+    updateColorTemp(device, accessory as any, wiz, next)(err);
+    expect(next).toHaveBeenCalledWith(err);
+  });
+});

@@ -1,0 +1,230 @@
+import {
+  beforeEach,
+  describe,
+  expect,
+  it,
+  mock,
+} from "bun:test";
+import { FakeSocket, makeDevice } from "./__helpers__/factories";
+import { makeFakeAPI, makeFakeLogger } from "./__mocks__/homebridge";
+
+// Only mock the dgram package so HomebridgeWizLan's constructor doesn't open
+// a real UDP socket. The real util/network functions then operate on our
+// FakeSocket — keeping the surface untouched for other test files.
+const sharedSocket = new FakeSocket();
+mock.module("dgram", () => ({
+  default: { createSocket: () => sharedSocket as any },
+  createSocket: () => sharedSocket as any,
+}));
+
+import HomebridgeWizLan from "../src/wiz";
+
+const makePlatform = (config: any = {}) => {
+  const api = makeFakeAPI();
+  const log = makeFakeLogger();
+  const platform = new HomebridgeWizLan(log as any, config, api);
+  return { platform, api, log };
+};
+
+beforeEach(() => {
+  sharedSocket.sent.length = 0;
+});
+
+describe("HomebridgeWizLan.constructor", () => {
+  it("attaches the dgram socket to the platform", () => {
+    const { platform } = makePlatform();
+    expect(platform.socket).toBe(sharedSocket as any);
+  });
+
+  it("starts discovery when api emits didFinishLaunching", () => {
+    const { api } = makePlatform();
+    api.emit("didFinishLaunching");
+    // sendDiscoveryBroadcast emits a registration message
+    const reg = sharedSocket.sent.find((s) => s.msg.includes("registration"));
+    expect(reg).toBeDefined();
+  });
+
+});
+
+describe("HomebridgeWizLan.initDiscoveryInterval", () => {
+  it("logs setup message when discoveryInterval is positive", () => {
+    const { api, log } = makePlatform({ discoveryInterval: 30 });
+    api.emit("didFinishLaunching");
+    const setupMsg = (log.info as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((m: string) => m.includes("Re-broadcasting every 30"));
+    expect(setupMsg).toBeDefined();
+  });
+
+  it("logs 'periodic re-discovery is off' when not configured", () => {
+    const { api, log } = makePlatform({});
+    api.emit("didFinishLaunching");
+    const offMsg = (log.info as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((m: string) => m.includes("Periodic re-discovery is off"));
+    expect(offMsg).toBeDefined();
+  });
+});
+
+describe("HomebridgeWizLan.deviceShouldBeIgnored", () => {
+  it("matches by MAC", () => {
+    const { platform } = makePlatform({
+      ignoredDevices: [{ mac: "AABBCCDDEEFF" }],
+    });
+    expect(
+      platform.deviceShouldBeIgnored(
+        makeDevice({ mac: "AABBCCDDEEFF", ip: "10.0.0.5" }),
+      ),
+    ).toBe(true);
+  });
+
+  it("matches by IP (host field)", () => {
+    const { platform } = makePlatform({
+      ignoredDevices: [{ host: "10.0.0.5" }],
+    });
+    expect(
+      platform.deviceShouldBeIgnored(
+        makeDevice({ mac: "OTHERMAC", ip: "10.0.0.5" }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not match unrelated devices", () => {
+    const { platform } = makePlatform({
+      ignoredDevices: [{ mac: "ZZZ" }],
+    });
+    expect(
+      platform.deviceShouldBeIgnored(
+        makeDevice({ mac: "AAA", ip: "1.1.1.1" }),
+      ),
+    ).toBe(false);
+  });
+
+  it("returns false when ignoredDevices is unset", () => {
+    const { platform } = makePlatform({});
+    expect(platform.deviceShouldBeIgnored(makeDevice())).toBe(false);
+  });
+});
+
+describe("HomebridgeWizLan.tryAddDevice", () => {
+  it("registers a new accessory for an unseen RGB bulb", () => {
+    const { platform, api } = makePlatform({});
+    platform.tryAddDevice(
+      makeDevice({ mac: "NEW1", ip: "10.0.0.10", model: "ESP01_SHRGB_03" }),
+    );
+    expect(api.registerPlatformAccessories).toHaveBeenCalledTimes(1);
+    expect(platform.accessories.length).toBe(1);
+    expect(Object.keys(platform.initializedAccessories).length).toBe(1);
+  });
+
+  it("updates an existing accessory rather than re-registering", () => {
+    const { platform, api } = makePlatform({});
+    const device = makeDevice({
+      mac: "EXIST1",
+      ip: "10.0.0.11",
+      model: "ESP01_SHRGB_03",
+    });
+    platform.tryAddDevice(device);
+    expect(api.registerPlatformAccessories).toHaveBeenCalledTimes(1);
+
+    // re-add the same device — should be an update, not a re-register
+    platform.tryAddDevice(device);
+    expect(api.registerPlatformAccessories).toHaveBeenCalledTimes(1);
+    expect(api.updatePlatformAccessories).toHaveBeenCalled();
+  });
+
+  it("skips devices whose model is unrecognized", () => {
+    const { platform, api, log } = makePlatform({});
+    platform.tryAddDevice(
+      makeDevice({ mac: "ALIEN", ip: "10.0.0.12", model: "XYZ_NOT_REAL" }),
+    );
+    expect(api.registerPlatformAccessories).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalled();
+  });
+
+  it("uses the friendly name override from config.devices when MAC matches", () => {
+    const { platform, api } = makePlatform({
+      devices: [{ mac: "OVR1", name: "Kitchen Lamp" }],
+    });
+    platform.tryAddDevice(
+      makeDevice({ mac: "OVR1", ip: "10.0.0.13", model: "ESP01_SHRGB_03" }),
+    );
+    const registered = (api.registerPlatformAccessories as any).mock
+      .calls[0][2][0];
+    expect(registered.displayName).toBe("Kitchen Lamp");
+  });
+
+  it("skips ignored devices (matched by MAC) without registering", () => {
+    const { platform, api } = makePlatform({
+      ignoredDevices: [{ mac: "IGN1" }],
+    });
+    platform.tryAddDevice(
+      makeDevice({ mac: "IGN1", ip: "10.0.0.14", model: "ESP01_SHRGB_03" }),
+    );
+    expect(api.registerPlatformAccessories).not.toHaveBeenCalled();
+  });
+
+  it("keys initializedAccessories by UUID (the #128 refactor)", () => {
+    const { platform, api } = makePlatform({});
+    platform.tryAddDevice(
+      makeDevice({ mac: "U1", ip: "10.0.0.15", model: "ESP01_SHRGB_03" }),
+    );
+    const uuid = api.hap.uuid.generate("U1");
+    expect(platform.initializedAccessories[uuid]).toBeDefined();
+  });
+});
+
+describe("HomebridgeWizLan.configureAccessory", () => {
+  it("loads cached accessories and initializes them", () => {
+    const { platform, api } = makePlatform({});
+    const acc = new api.platformAccessory("Cached Bulb", "uuid-cached");
+    acc.context = makeDevice({
+      mac: "CACHED1",
+      ip: "10.0.0.16",
+      model: "ESP01_SHRGB_03",
+    });
+    platform.configureAccessory(acc as any);
+    expect(platform.accessories).toContain(acc);
+    expect(platform.initializedAccessories["uuid-cached"]).toBeDefined();
+  });
+
+  it("unregisters ignored accessories on load", () => {
+    const { platform, api } = makePlatform({
+      ignoredDevices: [{ mac: "IGN_CACHED" }],
+    });
+    const acc = new api.platformAccessory("Bulb", "uuid-ignored");
+    acc.context = makeDevice({ mac: "IGN_CACHED", ip: "10.0.0.17" });
+    platform.configureAccessory(acc as any);
+    expect(api.unregisterPlatformAccessories).toHaveBeenCalled();
+    expect(platform.accessories).not.toContain(acc);
+  });
+
+  it("skips accessories whose context is missing a model (legacy schema)", () => {
+    const { platform, api } = makePlatform({});
+    const acc = new api.platformAccessory("Legacy", "uuid-legacy");
+    acc.context = {} as any;
+    platform.configureAccessory(acc as any);
+    expect(platform.initializedAccessories["uuid-legacy"]).toBeUndefined();
+  });
+});
+
+describe("HomebridgeWizLan.initRefreshInterval", () => {
+  it("does not schedule any timer when refreshInterval=0 (default)", () => {
+    const { platform, log } = makePlatform({});
+    // No throws, and at least one info log mentions Pings are off
+    const offMsg = (log.info as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((m: string) => m.includes("Pings are off"));
+    expect(offMsg).toBeDefined();
+    // No accessories ping after a moment
+    expect(Object.keys(platform.initializedAccessories).length).toBe(0);
+  });
+
+  it("logs setup message when refreshInterval is positive", () => {
+    const { log } = makePlatform({ refreshInterval: 30 });
+    const setupMsg = (log.info as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((m: string) => m.includes("Setting up ping"));
+    expect(setupMsg).toBeDefined();
+  });
+});

@@ -13,8 +13,8 @@ import { Config, Device } from "./types";
 import { bindSocket, createSocket, registerDiscoveryHandler, sendDiscoveryBroadcast } from "./util/network";
 
 export default class HomebridgeWizLan {
-  public readonly Service: typeof Service = this.api.hap.Service;
-  public readonly Characteristic: typeof Characteristic = this.api.hap.Characteristic;
+  public readonly Service: typeof Service;
+  public readonly Characteristic: typeof Characteristic;
 
   // this is used to track restored cached accessories
   public readonly accessories: PlatformAccessory[] = [];
@@ -26,6 +26,11 @@ export default class HomebridgeWizLan {
     public readonly config: Config,
     public readonly api: API
   ) {
+    // Assign after `this.api` is set, not via field initializer — under
+    // [[Define]] class-field semantics the initializer would run before the
+    // parameter property is assigned and dereference `undefined.hap`.
+    this.Service = this.api.hap.Service;
+    this.Characteristic = this.api.hap.Characteristic;
     this.socket = createSocket(this);
 
     // When this event is fired it means Homebridge has restored all cached accessories from disk.

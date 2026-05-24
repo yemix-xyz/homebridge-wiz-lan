@@ -12,7 +12,8 @@
     "skipLibCheck": true,
     "strict": true,
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "useDefineForClassFields": false
   },
   "include": ["src"]
 }
