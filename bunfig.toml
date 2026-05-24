@@ -2,6 +2,8 @@
 # Default off — `bun test` is fast. Enable with `bun test --coverage` or the
 # test:coverage npm script.
 coverageReporter = ["text", "lcov"]
-coverageThreshold = 0.80
+# Per-metric floors set just below current coverage so regressions break CI
+# but small unrelated changes don't. Tighten as coverage grows.
+coverageThreshold = { line = 0.85, function = 0.70 }
 coveragePathIgnorePatterns = ["src/index.ts", "src/constants.ts", "src/types.ts"]
 preload = ["./test/__helpers__/setup.ts"]

@@ -23,7 +23,7 @@ import {
   getPilot,
   setPilot,
 } from "../../../src/accessories/WizSocket/pilot";
-import { recordSuccess as _recordSuccess } from "../../../src/util/offline";
+import { isOffline, recordFailure, recordSuccess as _recordSuccess } from "../../../src/util/offline";
 import {
   makeDevice,
   makeFakeWiz,
@@ -49,6 +49,9 @@ beforeEach(() => {
   _recordSuccess(TEST_MAC);
   _recordSuccess(`${TEST_MAC}_T1`);
   _recordSuccess(`${TEST_MAC}_T2`);
+  for (const s of ["F1", "F2", "F3", "F4", "F5"]) {
+    _recordSuccess(`${TEST_MAC}_${s}`);
+  }
 });
 
 describe("WizSocket/pilot: getPilot", () => {
@@ -101,6 +104,95 @@ describe("WizSocket/pilot: getPilot", () => {
     );
     pendingGet[0](new Error("timeout"), null);
     expect(err).not.toBeNull();
+  });
+});
+
+describe("WizSocket/pilot: offline detection", () => {
+  it("marks device offline after pingFailuresBeforeOffline failures and emits HapStatusError", () => {
+    const mac = `${TEST_MAC}_F1`;
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 2 } as any);
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac, model: "ESP10_SOCKET_06" });
+
+    // First failure: under threshold — onError is the original network error (not HAP).
+    let err: any = null;
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (err = e));
+    pendingGet[0](new Error("timeout"), null);
+    expect(err).not.toBeNull();
+    expect(err.hapStatus).toBeUndefined();
+
+    // Second failure: crosses threshold — HapStatusError emitted.
+    err = null;
+    pendingGet.length = 0;
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (err = e));
+    pendingGet[0](new Error("timeout"), null);
+    expect(err).not.toBeNull();
+    expect(err.hapStatus).toBeDefined();
+    expect(wiz.log.warn).toHaveBeenCalled();
+    expect(isOffline(mac)).toBe(true);
+  });
+
+  it("fast-path: offline device gets immediate HapStatusError before the UDP reply", () => {
+    const mac = `${TEST_MAC}_F2`;
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 1 } as any);
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac, model: "ESP10_SOCKET_06" });
+    recordFailure(mac, 1);
+    expect(isOffline(mac)).toBe(true);
+
+    let err: any = null;
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (err = e));
+    expect(err).not.toBeNull();
+    expect(err.hapStatus).toBeDefined();
+    // _getPilot still fired so recovery can be detected.
+    expect(getPilotMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fast-path suppression: only one onError when a still-offline device fails again", () => {
+    const mac = `${TEST_MAC}_F3`;
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 1 } as any);
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac, model: "ESP10_SOCKET_06" });
+    recordFailure(mac, 1);
+
+    const onError = mock((_: Error) => {});
+    getPilot(wiz, accessory as any, device, () => {}, onError);
+    pendingGet[0](new Error("timeout"), null);
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovery: offline device replying successfully triggers updatePilot and clears offline state", () => {
+    const mac = `${TEST_MAC}_F4`;
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac, model: "ESP10_SOCKET_06" });
+    recordFailure(mac, 1);
+
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[0](null, makeSocketPilot({ mac, state: true }));
+
+    expect(isOffline(mac)).toBe(false);
+    expect(wiz.log.info).toHaveBeenCalled();
+    // updatePilot pushed a fresh value into the Outlet On characteristic.
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("setPilot fast-fails with HapStatusError when device is offline", () => {
+    const mac = `${TEST_MAC}_F5`;
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac, model: "ESP10_SOCKET_06" });
+    cachedPilot[mac] = makeSocketPilot({ mac, state: true });
+    recordFailure(mac, 1);
+
+    let err: any = null;
+    setPilot(wiz, accessory as any, device, { state: false }, (e) => (err = e));
+    expect(err).not.toBeNull();
+    expect(err.hapStatus).toBeDefined();
+    expect(setPilotMock).not.toHaveBeenCalled();
+    expect(cachedPilot[mac].state).toBe(true);
   });
 });
 

@@ -34,7 +34,7 @@ import {
   setPilot,
   updateColorTemp,
 } from "../../../src/accessories/WizLight/pilot";
-import { recordSuccess as _recordSuccess } from "../../../src/util/offline";
+import { isOffline, recordFailure, recordSuccess as _recordSuccess } from "../../../src/util/offline";
 import {
   makeAccessoryWithService,
   makeDevice,
@@ -57,6 +57,9 @@ beforeEach(() => {
   _recordSuccess(`${TEST_MAC}T1`);
   _recordSuccess(`${TEST_MAC}T2`);
   _recordSuccess(`${TEST_MAC}T3`);
+  for (const s of ["F1", "F2", "F3", "F4", "F5"]) {
+    _recordSuccess(`${TEST_MAC}${s}`);
+  }
 });
 
 describe("WizLight/pilot: pilotToColor", () => {
@@ -206,6 +209,99 @@ describe("WizLight/pilot: error fallback & offline handling", () => {
     expect((errSeen as any).hapStatus).toBeDefined();
     // log.warn was called with "now offline" message
     expect(wiz.log.warn).toHaveBeenCalled();
+  });
+});
+
+describe("WizLight/pilot: offline fast-path & recovery", () => {
+  it("fast-path: offline device gets immediate HapStatusError before the UDP reply", () => {
+    const mac = `${TEST_MAC}F1`;
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 1 } as any);
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+    // Mark offline first.
+    recordFailure(mac, 1);
+    expect(isOffline(mac)).toBe(true);
+
+    let err: any = null;
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (err = e));
+    // The onError must have fired synchronously, before any pending UDP reply.
+    expect(err).not.toBeNull();
+    expect(err.hapStatus).toBeDefined();
+    // _getPilot was still called so recovery can be detected.
+    expect(getPilotMock).toHaveBeenCalledTimes(1);
+    expect(pendingGet.length).toBe(1);
+  });
+
+  it("fast-path suppression: only one onError when a still-offline device fails again", () => {
+    const mac = `${TEST_MAC}F2`;
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 1 } as any);
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+    recordFailure(mac, 1);
+
+    const onError = mock((_: Error) => {});
+    getPilot(wiz, accessory as any, device, () => {}, onError);
+    // Now fire the pending UDP reply with an error — recordFailure runs again
+    // but threshold is already crossed (still offline), so onError must NOT
+    // fire a second time.
+    pendingGet[0](new Error("timeout"), null);
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovery: offline device replying successfully triggers updatePilot and clears offline state", () => {
+    const mac = `${TEST_MAC}F3`;
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+    recordFailure(mac, 1);
+    expect(isOffline(mac)).toBe(true);
+
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[0](
+      null,
+      makeLightPilot({ mac, state: true, dimming: 75 }),
+    );
+
+    expect(isOffline(mac)).toBe(false);
+    // "back online" info log
+    expect(wiz.log.info).toHaveBeenCalled();
+    // updatePilot pushed a fresh value into the On characteristic
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("setPilot fast-fails with HapStatusError when device is offline", () => {
+    const mac = `${TEST_MAC}F4`;
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+    cachedPilot[mac] = makeLightPilot({ mac, state: true });
+    recordFailure(mac, 1);
+
+    let err: any = null;
+    setPilot(wiz, accessory as any, device, { state: false }, (e) => (err = e));
+    expect(err).not.toBeNull();
+    expect(err.hapStatus).toBeDefined();
+    // No UDP packet attempted.
+    expect(setPilotMock).not.toHaveBeenCalled();
+    // Cache unchanged.
+    expect(cachedPilot[mac].state).toBe(true);
+  });
+
+  it("threshold clamp: pingFailuresBeforeOffline=0 is clamped to 1 (single failure marks offline)", () => {
+    const mac = `${TEST_MAC}F5`;
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 0 } as any);
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+
+    let err: any = null;
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (err = e));
+    pendingGet[0](new Error("timeout"), null);
+    // With clamp the single failure crosses threshold 1 — HapStatusError emitted.
+    expect(err).not.toBeNull();
+    expect(err.hapStatus).toBeDefined();
+    expect(isOffline(mac)).toBe(true);
   });
 });
 
