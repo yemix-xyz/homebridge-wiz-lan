@@ -1,4 +1,4 @@
-import { PlatformAccessory } from "homebridge";
+import { Characteristic, CharacteristicValue, PlatformAccessory } from "homebridge";
 
 import HomebridgeWizLan from "../../wiz";
 import { isOffline, recordFailureOnce, recordSuccess } from "../../util/offline";
@@ -47,58 +47,115 @@ export interface Pilot extends WizPilot {
 // to default values
 export const cachedPilot: { [mac: string]: Pilot } = {};
 
+// Bumped twice per setPilot: once when the write is optimistically committed
+// to cachedPilot, and again when it resolves (ack, send error, or timeout). A
+// getPilot probe captures the value when it is transmitted; if it differs when
+// the reply lands, the bulb generated that reply before the write reached it
+// — or while the write was still unresolved, so it may have. Committing such a
+// reply would roll cachedPilot — and the HomeKit tile — back to pre-write
+// state (cache-first reads leave probes in flight long enough for a user write
+// to interleave, and its ack can beat the delayed reply).
+//
+// The resolution bump is what covers a write that is committed but not yet on
+// the wire: between the two bumps the cache is ahead of the bulb, so a probe
+// transmitted in that window reads pre-write state while its snapshot already
+// matches the commit bump. Nothing would mark that reply stale — see the
+// failed-write reconciliation in setPilot, which probes while the write queued
+// behind it is still waiting its turn on the wire.
+export const writeGeneration: { [mac: string]: number } = {};
+
+// writeGeneration snapshot taken when the underlying UDP probe was actually
+// transmitted (via the network layer's onTransmit hook). Probes are coalesced
+// per device and may be deferred by the rate limiter, so a getPilot call can
+// be answered by a probe transmitted well after the call was made. Every
+// callback in that batch shares one reply and must compare against the
+// transmitting probe's snapshot, not one taken when they happened to call.
+const probeStartGeneration: { [mac: string]: number } = {};
+
 export const disabledAdaptiveLightingCallback: {
   [mac: string]: () => void;
 } = {};
+
+// Since 3.4.0 every cache-answered read pushes the probe result back into HAP,
+// which previously happened only when a device came back online. Re-publishing
+// a value HomeKit already holds still emits an event notification to every
+// subscribed controller, and controllers respond to notifications by reading —
+// which starts another probe, which pushes again. Suppressing the no-ops
+// breaks that loop; `force` covers the one case where HomeKit's stored value
+// is not a reliable guide, namely clearing a "No Response" error state.
+function push(
+  characteristic: Characteristic,
+  value: CharacteristicValue | Error,
+  force: boolean
+) {
+  if (!force && characteristic.value === value) {
+    return;
+  }
+  characteristic.updateValue(value);
+}
 
 function updatePilot(
   wiz: HomebridgeWizLan,
   accessory: PlatformAccessory,
   device: Device,
-  pilot: Pilot | Error
+  pilot: Pilot | Error,
+  force = false
 ) {
   const { Service } = wiz;
   const service = accessory.getService(Service.Lightbulb)!;
+  // An error is always published: it flips the tile to "No Response", which is
+  // a state change HomeKit's stored value doesn't reflect.
+  const always = force || pilot instanceof Error;
 
-  service
-    .getCharacteristic(wiz.Characteristic.On)
-    .updateValue(pilot instanceof Error ? pilot : transformOnOff(pilot));
-  service
-    .getCharacteristic(wiz.Characteristic.Brightness)
-    .updateValue(pilot instanceof Error ? pilot : transformDimming(pilot));
+  push(
+    service.getCharacteristic(wiz.Characteristic.On),
+    pilot instanceof Error ? pilot : transformOnOff(pilot),
+    always
+  );
+  push(
+    service.getCharacteristic(wiz.Characteristic.Brightness),
+    pilot instanceof Error ? pilot : transformDimming(pilot),
+    always
+  );
   if (isTW(device) || isRGB(device)) {
     let useCT = true;
     if (!(pilot instanceof Error) && pilot.sceneId && pilot.sceneId > 0) {
       useCT = false;
     }
     if (useCT) {
-      service
-        .getCharacteristic(wiz.Characteristic.ColorTemperature)
-        .updateValue(
-          pilot instanceof Error ? pilot : transformTemperature(pilot)
-        );
+      push(
+        service.getCharacteristic(wiz.Characteristic.ColorTemperature),
+        pilot instanceof Error ? pilot : transformTemperature(pilot),
+        always
+      );
     }
   }
   if (isRGB(device)) {
-    service
-      .getCharacteristic(wiz.Characteristic.Hue)
-      .updateValue(pilot instanceof Error ? pilot : transformHue(pilot));
-    service
-      .getCharacteristic(wiz.Characteristic.Saturation)
-      .updateValue(pilot instanceof Error ? pilot : transformSaturation(pilot));
+    push(
+      service.getCharacteristic(wiz.Characteristic.Hue),
+      pilot instanceof Error ? pilot : transformHue(pilot),
+      always
+    );
+    push(
+      service.getCharacteristic(wiz.Characteristic.Saturation),
+      pilot instanceof Error ? pilot : transformSaturation(pilot),
+      always
+    );
   }
 
   const scenesService = accessory.getService(Service.Television);
 
   if (scenesService != null) {
-    scenesService
-      .getCharacteristic(wiz.Characteristic.Active)
-      .updateValue(
-        pilot instanceof Error ? pilot : transformOnOff(pilot)
-      );
-    scenesService!
-      .getCharacteristic(wiz.Characteristic.ActiveIdentifier)
-      .updateValue(pilot instanceof Error ? pilot : transformEffectId(pilot));
+    push(
+      scenesService.getCharacteristic(wiz.Characteristic.Active),
+      pilot instanceof Error ? pilot : transformOnOff(pilot),
+      always
+    );
+    push(
+      scenesService.getCharacteristic(wiz.Characteristic.ActiveIdentifier),
+      pilot instanceof Error ? pilot : transformEffectId(pilot),
+      always
+    );
   }
 
 }
@@ -129,7 +186,13 @@ export function getPilot(
     responded = true;
   }
 
-  _getPilot<Pilot>(wiz, device, (error, pilot) => {
+  const handleReply = (error: Error | null, pilot: Pilot) => {
+    // Read at reply time, not call time: the network layer may have deferred
+    // and coalesced this call onto a probe transmitted later, and every
+    // callback in that batch shares the transmitting probe's snapshot. Safe to
+    // read from the map because a probe's callbacks all run synchronously
+    // before any later probe for the same device can transmit.
+    const generationAtProbeStart = probeStartGeneration[device.mac] ?? 0;
     if (error !== null) {
       const threshold = Math.max(1, Number(wiz.config.pingFailuresBeforeOffline ?? 3));
       const newlyOffline = recordFailureOnce(error, device.mac, threshold);
@@ -158,10 +221,30 @@ export function getPilot(
       wiz.log.info(`[${device.mac}] Device is back online`);
     }
 
+    if ((writeGeneration[device.mac] ?? 0) !== generationAtProbeStart) {
+      // A write went out while this probe was in flight, so the reply is
+      // stale even though it arrived last. Drop it — the next probe reports
+      // post-write truth — but recordSuccess above still counted the reply
+      // for offline tracking (the device did answer).
+      wiz.log.debug(
+        `[getPilot] Discarding stale reply from ${device.mac}: a write raced ahead of it`
+      );
+      if (!responded) {
+        // HomeKit is still waiting on this GET — answer with the freshest
+        // known state instead of the pre-write reply.
+        onSuccess(cachedPilot[device.mac] ?? pilot);
+      }
+      return;
+    }
+
     const old = cachedPilot[device.mac];
     if (
       typeof old !== "undefined" &&
-      (pilot.sceneId !== 0 ||
+      // Some firmware reports "no scene" as a missing sceneId rather than 0;
+      // treat both the same, like updatePilot's useCT check does — otherwise
+      // every reply from such a bulb reads as an active scene and disables
+      // adaptive lighting on every poll.
+      ((pilot.sceneId ?? 0) !== 0 ||
         pilot.r !== old.r ||
         pilot.g !== old.g ||
         pilot.b !== old.b ||
@@ -175,11 +258,24 @@ export function getPilot(
     };
     if (responded) {
       // HomeKit was answered from cache (or shown "No Response") — push the
-      // fresh state so the tile converges on reality
-      updatePilot(wiz, accessory, device, pilot);
+      // fresh state so the tile converges on reality. Only changed values go
+      // out, except when the device just came back: HomeKit is holding an
+      // error state that a value-equality check can't see.
+      updatePilot(wiz, accessory, device, pilot, cameBack);
     } else {
       onSuccess(pilot);
     }
+  };
+
+  _getPilot<Pilot>(wiz, device, handleReply, {
+    // Only retransmit when HomeKit is actually blocked on this reply. If the
+    // GET was already answered from cache (or with "No Response"), the second
+    // copy is invisible to the user and only doubles the load on a device that
+    // is already slow to answer.
+    retransmit: !responded,
+    onTransmit: () => {
+      probeStartGeneration[device.mac] = writeGeneration[device.mac] ?? 0;
+    },
   });
 }
 
@@ -222,10 +318,21 @@ export function setPilot(
     ...oldPilot,
     ...newPilot,
   } as Pilot;
+  // Mark in-flight probes stale before the cache commit: their replies
+  // predate this write, and a delayed one landing after the ack must not
+  // clobber the newer state. Not undone on rollback — a timed-out write may
+  // still have reached the bulb, so pre-write replies stay untrustworthy.
+  writeGeneration[device.mac] = (writeGeneration[device.mac] ?? 0) + 1;
   cachedPilot[device.mac] = optimisticPilot;
   const outboundPilot =
     wiz.config.lastStatus && isStateOnlyUpdate ? { state: pilot.state } : newPilot;
   return _setPilot(wiz, device, outboundPilot, (error) => {
+    // Resolution bump — see writeGeneration. Must happen before the
+    // reconciliation probe below so that probe's snapshot includes this
+    // write's resolution and its reply is not discarded on our account; a
+    // write still queued behind us bumps again when it resolves, which is
+    // exactly what invalidates a probe transmitted before it was sent.
+    writeGeneration[device.mac] = (writeGeneration[device.mac] ?? 0) + 1;
     // Roll back only while this write still owns the cache entry. A newer
     // queued write (or a fresh getPilot) may have replaced it by the time
     // this write times out — the queued command is still transmitted after
@@ -233,6 +340,14 @@ export function setPilot(
     // would leave the cache behind the confirmed device state.
     if (error !== null && cachedPilot[device.mac] === optimisticPilot) {
       cachedPilot[device.mac] = oldPilot;
+    }
+    if (error !== null) {
+      // A timed-out write may still have reached the bulb (lost ack), so
+      // neither the rolled-back snapshot nor the optimistic state is
+      // trustworthy now — probe the device so cache and HomeKit converge on
+      // truth instead of waiting for the next poll. Coalesces with any probe
+      // already in flight.
+      getPilot(wiz, accessory, device, () => {}, () => {});
     }
     callback(error);
   });

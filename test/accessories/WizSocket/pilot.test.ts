@@ -2,9 +2,35 @@ import { beforeEach, describe, expect, it, mock } from "bun:test";
 
 const pendingGet: ((e: Error | null, p: any) => void)[] = [];
 const pendingSet: ((e: Error | null) => void)[] = [];
+// Mirror the real layer's per-mac coalescing: the first unresolved call for a
+// mac transmits the probe and later calls piggyback on it. Firing the
+// transmitting call's callback closes the probe, like the real reply handler
+// deleting the queue entry before running the batch. The transmitting call
+// also runs `onTransmit`, which is how the accessory layer snapshots state as
+// of the moment the packet goes on the wire.
+const openGetProbes = new Set<string>();
+const getPilotOptions: any[] = [];
 const getPilotMock = mock(
-  (_w: any, _d: any, cb: (e: Error | null, p: any) => void) => {
-    pendingGet.push(cb);
+  (
+    _w: any,
+    d: any,
+    cb: (e: Error | null, p: any) => void,
+    options?: { retransmit?: boolean; onTransmit?: () => void },
+  ) => {
+    getPilotOptions.push(options);
+    const startedProbe = !openGetProbes.has(d.mac);
+    if (startedProbe) {
+      openGetProbes.add(d.mac);
+      options?.onTransmit?.();
+    }
+    let fired = false;
+    pendingGet.push((e, p) => {
+      if (!fired) {
+        fired = true;
+        if (startedProbe) openGetProbes.delete(d.mac);
+      }
+      cb(e, p);
+    });
   },
 );
 const setPilotMock = mock(
@@ -16,12 +42,14 @@ const setPilotMock = mock(
 mock.module("../../../src/util/network", () => ({
   getPilot: getPilotMock,
   setPilot: setPilotMock,
+  hasInFlightGetPilot: (mac: string) => openGetProbes.has(mac),
 }));
 
 import {
   cachedPilot,
   getPilot,
   setPilot,
+  writeGeneration,
 } from "../../../src/accessories/WizSocket/pilot";
 import { isOffline, recordFailure, recordSuccess as _recordSuccess } from "../../../src/util/offline";
 import {
@@ -41,8 +69,11 @@ const makeOutletAccessory = () => {
 
 beforeEach(() => {
   for (const k of Object.keys(cachedPilot)) delete cachedPilot[k];
+  for (const k of Object.keys(writeGeneration)) delete writeGeneration[k];
   pendingGet.length = 0;
   pendingSet.length = 0;
+  openGetProbes.clear();
+  getPilotOptions.length = 0;
   getPilotMock.mockClear();
   setPilotMock.mockClear();
   // Reset offline state for any MAC a test might use
@@ -148,6 +179,67 @@ describe("WizSocket/pilot: cache-first responses", () => {
   });
 });
 
+// Same regression guard as the light: re-publishing an unchanged value still
+// emits a HAP event notification, and controllers answer notifications by
+// reading — each read being a UDP probe.
+describe("WizSocket/pilot: characteristic updates are change-driven", () => {
+  const poll = (wiz: any, accessory: any, device: any, pilot: any) => {
+    getPilot(wiz, accessory, device, () => {}, () => {});
+    pendingGet[pendingGet.length - 1](null, pilot);
+  };
+
+  it("does not re-publish On when the reply matches what HomeKit holds", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: true });
+    const on = accessory
+      .getService(wiz.Service.Outlet)!
+      .getCharacteristic(wiz.Characteristic.On);
+
+    for (let i = 0; i < 5; i++) {
+      poll(wiz, accessory, device, makeSocketPilot({ mac: TEST_MAC, state: true }));
+    }
+    // Published once, on the first poll, then never again while state holds.
+    expect(on.updateValue).toHaveBeenCalledTimes(1);
+
+    poll(wiz, accessory, device, makeSocketPilot({ mac: TEST_MAC, state: false }));
+    expect(on.updateValue).toHaveBeenCalledTimes(2);
+  });
+
+  it("force-publishes when the device comes back from offline", () => {
+    const mac = `${TEST_MAC}_BACK`;
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac });
+    const on = accessory
+      .getService(wiz.Service.Outlet)!
+      .getCharacteristic(wiz.Characteristic.On);
+
+    cachedPilot[mac] = makeSocketPilot({ mac, state: true });
+    poll(wiz, accessory, device, makeSocketPilot({ mac, state: true }));
+    const before = (on.updateValue as any).mock.calls.length;
+    recordFailure(mac, 1);
+
+    poll(wiz, accessory, device, makeSocketPilot({ mac, state: true }));
+    expect((on.updateValue as any).mock.calls.length).toBeGreaterThan(before);
+    _recordSuccess(mac);
+  });
+
+  it("asks for a retransmit only when HomeKit is blocked on the reply", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC });
+
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[0].retransmit).toBe(true);
+
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC }));
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[1].retransmit).toBe(false);
+  });
+});
+
 describe("WizSocket/pilot: offline detection", () => {
   it("marks device offline after pingFailuresBeforeOffline failures and emits HapStatusError", () => {
     const mac = `${TEST_MAC}_F1`;
@@ -234,6 +326,163 @@ describe("WizSocket/pilot: offline detection", () => {
     expect(err.hapStatus).toBeDefined();
     expect(setPilotMock).not.toHaveBeenCalled();
     expect(cachedPilot[mac].state).toBe(true);
+  });
+});
+
+describe("WizSocket/pilot: stale probe replies vs. interleaved writes", () => {
+  it("discards a delayed pre-write probe reply that lands after a setPilot ack", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    // HomeKit GET is answered from cache; the probe stays in flight.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(pendingGet.length).toBe(1);
+    // The user flips the outlet on; the write is acked before the reply lands.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    // The delayed probe reply carries pre-write state.
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: false }));
+    // It must neither clobber the cache…
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    // …nor push the old value back to the HomeKit characteristic.
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+  });
+
+  it("commits replies from probes started after the write (cache self-heals)", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: false }));
+    // A probe started after the write is not stale: its reply is device truth.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[1](null, makeSocketPilot({ mac: TEST_MAC, state: true, rssi: -42 }));
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    expect(cachedPilot[TEST_MAC].rssi).toBe(-42);
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("discards the stale reply for callers that piggybacked onto the probe after the write", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    // Caller A transmits the probe before the write.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // The write goes out and is acked while the probe is still open.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    // Caller B lands inside the probe window and piggybacks (the real layer
+    // sends no new packet) — it must inherit the probe's pre-write snapshot,
+    // not read the post-write generation and trust the shared reply.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // The shared pre-write reply resolves the whole batch.
+    const staleReply = makeSocketPilot({ mac: TEST_MAC, state: false });
+    pendingGet[0](null, staleReply);
+    pendingGet[1](null, staleReply);
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+  });
+
+  it("answers a still-waiting GET with post-write cache state when the reply is stale", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    // No cache at probe start → the GET stays unanswered until the reply.
+    let received: any = null;
+    getPilot(wiz, accessory as any, device, (p) => (received = p), () => {});
+    expect(received).toBeNull();
+    // Cache gets seeded and a write races in while the probe is still out.
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    // The stale reply must still resolve the GET — with the newer state.
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: false }));
+    expect(received).not.toBeNull();
+    expect(received.state).toBe(true);
+  });
+
+  it("a setPilot that fails before transmitting does not mark probes stale", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    let received: any = null;
+    getPilot(wiz, accessory as any, device, (p) => (received = p), () => {});
+    // No cached state → this write errors out synchronously, nothing is sent.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    expect(setPilotMock).not.toHaveBeenCalled();
+    // The probe reply is not stale — no write actually went out.
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: true, rssi: -33 }));
+    expect(received).not.toBeNull();
+    expect(received.rssi).toBe(-33);
+    expect(cachedPilot[TEST_MAC].rssi).toBe(-33);
+  });
+});
+
+describe("WizSocket/pilot: failed-write resync", () => {
+  it("probes the device after a failed write so the cache converges on truth", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    expect(pendingGet.length).toBe(0);
+    pendingSet[0](new Error("ack timeout"));
+    // Cache rolled back...
+    expect(cachedPilot[TEST_MAC].state).toBe(false);
+    // ...and a resync probe went out. The lost-ack write actually applied:
+    expect(pendingGet.length).toBe(1);
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: true }));
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("does not let the resync probe roll back a write that was still queued behind the failure", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    // A goes on the wire; B is committed to the cache but parks behind A in
+    // the network layer's queue, so nothing of B has reached the device yet.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    setPilot(wiz, accessory as any, device, { state: false }, () => {});
+    expect(cachedPilot[TEST_MAC].state).toBe(false);
+
+    // A's ack times out. Its resync probe is transmitted while B is still
+    // unsent, so the device answers it with post-A/pre-B state.
+    pendingSet[0](new Error("ack timeout"));
+    expect(pendingGet.length).toBe(1);
+    // B is then flushed and acked — the cache's state:false is now confirmed.
+    pendingSet[1](null);
+    // The probe reply predates B and must not resurrect A's state.
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: true }));
+    expect(cachedPilot[TEST_MAC].state).toBe(false);
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+  });
+
+  it("does not probe after a successful write", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    expect(pendingGet.length).toBe(0);
   });
 });
 

@@ -10,9 +10,35 @@ import {
 // network callbacks manually to simulate UDP replies.
 const pendingGet: ((e: Error | null, p: any) => void)[] = [];
 const pendingSet: ((e: Error | null) => void)[] = [];
+// Mirror the real layer's per-mac coalescing: the first unresolved call for a
+// mac transmits the probe and later calls piggyback on it. Firing the
+// transmitting call's callback closes the probe, like the real reply handler
+// deleting the queue entry before running the batch. The transmitting call
+// also runs `onTransmit`, which is how the accessory layer snapshots state as
+// of the moment the packet goes on the wire.
+const openGetProbes = new Set<string>();
+const getPilotOptions: any[] = [];
 const getPilotMock = mock(
-  (_w: any, _d: any, cb: (e: Error | null, p: any) => void) => {
-    pendingGet.push(cb);
+  (
+    _w: any,
+    d: any,
+    cb: (e: Error | null, p: any) => void,
+    options?: { retransmit?: boolean; onTransmit?: () => void },
+  ) => {
+    getPilotOptions.push(options);
+    const startedProbe = !openGetProbes.has(d.mac);
+    if (startedProbe) {
+      openGetProbes.add(d.mac);
+      options?.onTransmit?.();
+    }
+    let fired = false;
+    pendingGet.push((e, p) => {
+      if (!fired) {
+        fired = true;
+        if (startedProbe) openGetProbes.delete(d.mac);
+      }
+      cb(e, p);
+    });
   },
 );
 const setPilotMock = mock(
@@ -24,6 +50,7 @@ const setPilotMock = mock(
 mock.module("../../../src/util/network", () => ({
   getPilot: getPilotMock,
   setPilot: setPilotMock,
+  hasInFlightGetPilot: (mac: string) => openGetProbes.has(mac),
 }));
 
 import {
@@ -33,6 +60,7 @@ import {
   pilotToColor,
   setPilot,
   updateColorTemp,
+  writeGeneration,
 } from "../../../src/accessories/WizLight/pilot";
 import { isOffline, recordFailure, recordSuccess as _recordSuccess } from "../../../src/util/offline";
 import {
@@ -46,10 +74,13 @@ const TEST_MAC = "AABBCCDDEEFF";
 
 beforeEach(() => {
   for (const k of Object.keys(cachedPilot)) delete cachedPilot[k];
+  for (const k of Object.keys(writeGeneration)) delete writeGeneration[k];
   for (const k of Object.keys(disabledAdaptiveLightingCallback))
     delete disabledAdaptiveLightingCallback[k];
   pendingGet.length = 0;
   pendingSet.length = 0;
+  openGetProbes.clear();
+  getPilotOptions.length = 0;
   getPilotMock.mockClear();
   setPilotMock.mockClear();
   // clear offline state for any MAC a test might use
@@ -379,6 +410,103 @@ describe("WizLight/pilot: cache-first responses", () => {
   });
 });
 
+// Regression guard for the UDP flood: 3.4.0 made every cache-answered read
+// re-publish the probe result to HAP. Republishing a value HomeKit already
+// holds still emits an event notification, controllers answer notifications by
+// reading, and every read starts another probe — a feedback loop with a UDP
+// packet in it. Only genuine changes may be published.
+describe("WizLight/pilot: characteristic updates are change-driven", () => {
+  const poll = (wiz: any, accessory: any, device: any, pilot: any) => {
+    getPilot(wiz, accessory, device, () => {}, () => {});
+    pendingGet[pendingGet.length - 1](null, pilot);
+  };
+
+  it("does not re-publish characteristics when the reply matches what HomeKit holds", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 });
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    const on = svc.getCharacteristic(wiz.Characteristic.On);
+    const brightness = svc.getCharacteristic(wiz.Characteristic.Brightness);
+
+    const steady = () => makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 });
+    // First poll publishes — HomeKit holds nothing yet.
+    poll(wiz, accessory, device, steady());
+    expect(on.updateValue).toHaveBeenCalledTimes(1);
+    const brightnessPushes = (brightness.updateValue as any).mock.calls.length;
+
+    // Four more polls, same state each time: nothing further goes to HAP.
+    for (let i = 0; i < 4; i++) poll(wiz, accessory, device, steady());
+    expect(on.updateValue).toHaveBeenCalledTimes(1);
+    expect((brightness.updateValue as any).mock.calls.length).toBe(brightnessPushes);
+  });
+
+  it("still publishes when the state actually changes", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 });
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    const on = svc.getCharacteristic(wiz.Characteristic.On);
+
+    poll(wiz, accessory, device, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 }));
+    poll(wiz, accessory, device, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 50 }));
+    expect(on.updateValue).toHaveBeenCalledTimes(2);
+    expect(on.value).toBe(0);
+  });
+
+  it("force-publishes when a device comes back, since HomeKit is holding an error", () => {
+    const mac = `${TEST_MAC}_BACK`;
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac, model: "ESP01_SHRGB_03" });
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    const on = svc.getCharacteristic(wiz.Characteristic.On);
+
+    // Establish the value HomeKit holds, then knock the device offline.
+    cachedPilot[mac] = makeLightPilot({ mac, state: true, dimming: 50 });
+    poll(wiz, accessory, device, makeLightPilot({ mac, state: true, dimming: 50 }));
+    const before = (on.updateValue as any).mock.calls.length;
+    recordFailure(mac, 1);
+
+    // It recovers reporting exactly the value HomeKit already has. Equality
+    // says "no change", but the tile is showing "No Response" — publish anyway.
+    poll(wiz, accessory, device, makeLightPilot({ mac, state: true, dimming: 50 }));
+    expect((on.updateValue as any).mock.calls.length).toBeGreaterThan(before);
+    _recordSuccess(mac);
+  });
+});
+
+describe("WizLight/pilot: probe retransmit is opt-in", () => {
+  it("asks for a retransmit only when HomeKit is blocked on the reply", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC });
+
+    // No cache: HomeKit is waiting, so the extra copy is worth its cost.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[0].retransmit).toBe(true);
+
+    // Cache warm: the GET was already answered, so a second copy buys nothing
+    // visible and only doubles the load on a device that is answering slowly.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC }));
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[1].retransmit).toBe(false);
+  });
+
+  it("does not retransmit at a device already known to be offline", () => {
+    const mac = `${TEST_MAC}_OFF2`;
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+    recordFailure(mac, 1);
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[0].retransmit).toBe(false);
+    _recordSuccess(mac);
+  });
+});
+
 describe("WizLight/pilot: setPilot scene/color exclusivity", () => {
   const baseDevice = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
 
@@ -497,6 +625,241 @@ describe("WizLight/pilot: setPilot scene/color exclusivity", () => {
     pendingSet[1](null);
     expect(cachedPilot[TEST_MAC].state).toBe(true);
     expect(cachedPilot[TEST_MAC].dimming).toBe(80);
+  });
+});
+
+describe("WizLight/pilot: stale probe replies vs. interleaved writes", () => {
+  const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+
+  it("discards a delayed pre-write probe reply that lands after a setPilot ack", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    // HomeKit GET is answered from cache; the probe stays in flight.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(pendingGet.length).toBe(1);
+    // The user flips the tile on; the write is acked before the reply lands.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    // Now the delayed probe reply arrives carrying pre-write state.
+    pendingGet[0](
+      null,
+      makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 }),
+    );
+    // It must neither clobber the cache…
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    // …nor push the old value back to the HomeKit characteristics.
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+    expect(svc.getCharacteristic(wiz.Characteristic.Brightness).updateValue)
+      .not.toHaveBeenCalled();
+  });
+
+  it("does not disable adaptive lighting off a stale reply's old color", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 10,
+      g: 10,
+      b: 10,
+    });
+    let adaptiveDisabled = false;
+    disabledAdaptiveLightingCallback[TEST_MAC] = () => {
+      adaptiveDisabled = true;
+    };
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    setPilot(wiz, accessory as any, device, { r: 200, g: 0, b: 0 }, () => {});
+    pendingSet[0](null);
+    // The stale reply repeats the pre-write color, which differs from the
+    // post-write cache — without the generation guard that difference reads
+    // as an external change and kills adaptive lighting.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, r: 10, g: 10, b: 10 }));
+    expect(adaptiveDisabled).toBe(false);
+    expect(cachedPilot[TEST_MAC].r).toBe(200);
+  });
+
+  it("commits replies from probes started after the write (cache self-heals)", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 }));
+    // A probe started after the write is not stale: its reply is device truth.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[1](null, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 35 }));
+    expect(cachedPilot[TEST_MAC].dimming).toBe(35);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.Brightness).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("still discards the stale reply when the interleaved write failed and rolled back", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const oldPilot = makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 });
+    cachedPilot[TEST_MAC] = oldPilot;
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](new Error("ack timeout"));
+    expect(cachedPilot[TEST_MAC]).toBe(oldPilot);
+    // A timed-out write may still have reached the bulb (lost ack), so this
+    // reply — generated before the write — remains untrustworthy.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 55 }));
+    expect(cachedPilot[TEST_MAC]).toBe(oldPilot);
+    expect(cachedPilot[TEST_MAC].dimming).toBe(20);
+  });
+
+  it("answers a still-waiting GET with post-write cache state when the reply is stale", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    // No cache at probe start → the GET stays unanswered until the reply.
+    let received: any = null;
+    getPilot(wiz, accessory as any, device, (p) => (received = p), () => {});
+    expect(received).toBeNull();
+    // Cache gets seeded and a write races in while the probe is still out.
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    // The stale reply must still resolve the GET — with the newer state.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false }));
+    expect(received).not.toBeNull();
+    expect(received.state).toBe(true);
+  });
+
+  it("a setPilot that fails before transmitting does not mark probes stale", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    let received: any = null;
+    getPilot(wiz, accessory as any, device, (p) => (received = p), () => {});
+    // No cached state → this write errors out synchronously, nothing is sent.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    expect(setPilotMock).not.toHaveBeenCalled();
+    // The probe reply is not stale — no write actually went out.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 66 }));
+    expect(received).not.toBeNull();
+    expect(received.dimming).toBe(66);
+    expect(cachedPilot[TEST_MAC].dimming).toBe(66);
+  });
+
+  it("discards the stale reply for callers that piggybacked onto the probe after the write", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    // Caller A transmits the probe before the write.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // The write goes out and is acked while the probe is still open.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    // Caller B lands inside the probe window and piggybacks (the real layer
+    // sends no new packet) — it must inherit the probe's pre-write snapshot,
+    // not read the post-write generation and trust the shared reply.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // The shared pre-write reply resolves the whole batch.
+    const staleReply = makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 });
+    pendingGet[0](null, staleReply);
+    pendingGet[1](null, staleReply);
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+    // A probe transmitted after the write still converges the cache.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[2](null, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 35 }));
+    expect(cachedPilot[TEST_MAC].dimming).toBe(35);
+  });
+});
+
+describe("WizLight/pilot: failed-write resync", () => {
+  const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+
+  it("probes the device after a failed write so the cache converges on truth", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    setPilot(wiz, accessory as any, device, { dimming: 80 }, () => {});
+    expect(pendingGet.length).toBe(0);
+    pendingSet[0](new Error("ack timeout"));
+    // Cache rolled back...
+    expect(cachedPilot[TEST_MAC].dimming).toBe(20);
+    // ...and a resync probe went out. The lost-ack write actually applied:
+    expect(pendingGet.length).toBe(1);
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 80 }));
+    expect(cachedPilot[TEST_MAC].dimming).toBe(80);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.Brightness).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("does not probe after a successful write", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    expect(pendingGet.length).toBe(0);
+  });
+});
+
+describe("WizLight/pilot: sceneId normalization", () => {
+  const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+
+  it("a reply that omits sceneId with unchanged colors does not disable adaptive lighting", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 10,
+      g: 10,
+      b: 10,
+    });
+    let adaptiveDisabled = false;
+    disabledAdaptiveLightingCallback[TEST_MAC] = () => {
+      adaptiveDisabled = true;
+    };
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // Firmware that reports "no scene" as a missing sceneId (not 0) must be
+    // treated like sceneId 0, matching updatePilot's useCT check.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, r: 10, g: 10, b: 10 }));
+    expect(adaptiveDisabled).toBe(false);
+  });
+
+  it("still disables adaptive lighting when a sceneId-less reply shows a real color change", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 10,
+      g: 10,
+      b: 10,
+    });
+    let adaptiveDisabled = false;
+    disabledAdaptiveLightingCallback[TEST_MAC] = () => {
+      adaptiveDisabled = true;
+    };
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, r: 200, g: 0, b: 0 }));
+    expect(adaptiveDisabled).toBe(true);
   });
 });
 
