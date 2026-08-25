@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.4.2
+- [FIX] Rate-limit and stagger UDP probes, back off offline devices, and suppress unchanged HomeKit updates to prevent read/notification feedback loops from flooding the LAN
+- [FIX] Prevent delayed `getPilot` replies from overwriting newer writes, while reconciling state after lost `setPilot` acknowledgements
+- Thank you [@ulm0](https://github.com/ulm0) for [#178](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/178)
+
 ## 3.4.1
 - [FIX] Add a 2-second `setPilot` acknowledgement timeout so lost UDP acknowledgements no longer wedge later commands, while preserving newer queued cache state
 - [FIX] Retransmit `getPilot` once and serve cached state immediately while refreshing HomeKit in the background, reducing "Updating…" delays on lossy Wi-Fi
